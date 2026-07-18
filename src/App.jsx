@@ -193,12 +193,25 @@ async function getCandles(chainKey, pairAddress) {
 // small trade can spike the recorded "high" for one candle to something unrealistic
 // even though no real volume traded there. Falls back to the unfiltered set only if
 // every candle looks thin (better an estimate than nothing).
-function computeAth(candles, supply) {
+// `currentMarketCap` (optional) is used as a sanity check: some historical candles
+// from Moralis's OHLCV endpoint appear to occasionally be priced in the pair's quote
+// token (e.g. WETH) rather than actual USD, especially for older days before USD
+// backfill — multiplying that by supply produces a wildly implausible "ATH" (seen:
+// $22B ATH against a $19M current cap on a token with no real record of an event like
+// that). A gap that extreme is a data artifact, not price history, so it's discarded
+// rather than shown as a number nobody should trust.
+const ATH_IMPLAUSIBLE_MULTIPLE = 200;
+
+function computeAth(candles, supply, currentMarketCap = null) {
   if (!candles.length || !supply) return null;
   const reliable = candles.filter((c) => Number(c.trades) >= 3);
   const pool = reliable.length ? reliable : candles;
   const athCandle = pool.reduce((a, b) => (Number(b.high) > Number(a.high) ? b : a));
-  return { marketCap: Number(athCandle.high) * supply, date: athCandle.timestamp?.slice(0, 10) || null };
+  const athMarketCap = Number(athCandle.high) * supply;
+  if (currentMarketCap && athMarketCap > currentMarketCap * ATH_IMPLAUSIBLE_MULTIPLE) {
+    return null;
+  }
+  return { marketCap: athMarketCap, date: athCandle.timestamp?.slice(0, 10) || null };
 }
 
 async function analyzeHolders(chainKey, address, pairAddressSet, candles, supply) {
@@ -563,7 +576,7 @@ async function analyze(address, chainKey = DEFAULT_CHAIN) {
   const marketCap = dexScreener?.marketCap ?? (metaPrice.usdPrice && metaPrice.supply ? metaPrice.usdPrice * metaPrice.supply : null);
   const marketCapIsEstimate = dexScreener?.marketCap == null;
   const supplyForAth = dexScreener?.impliedSupply ?? metaPrice.supply;
-  const ath = computeAth(candles, supplyForAth);
+  const ath = computeAth(candles, supplyForAth, marketCap);
 
   const holdersResult = await analyzeHolders(chainKey, addr, pairsInfo.pairAddressSet, candles, supplyForAth).catch(() => null);
   const holderData = holdersResult;
