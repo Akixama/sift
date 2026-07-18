@@ -147,7 +147,7 @@ async function getDexScreenerMarketData(chainKey, address) {
   const poolAgeDays = poolCreatedAt ? Math.floor((Date.now() - poolCreatedAt) / (1000 * 60 * 60 * 24)) : null;
   const liquidityUsd = best.liquidity?.usd != null ? Number(best.liquidity.usd) : null;
 
-  return { marketCap, impliedSupply, websites, socials, poolAgeDays, liquidityUsd };
+  return { marketCap, impliedSupply, websites, socials, poolAgeDays, liquidityUsd, priceUsd };
 }
 
 async function getTokenMetaAndPrice(chainKey, address) {
@@ -617,6 +617,8 @@ async function analyze(address, chainKey = DEFAULT_CHAIN) {
     websites: dexScreener?.websites || [],
     socials: dexScreener?.socials || [],
     poolAgeDays: dexScreener?.poolAgeDays ?? null,
+    liquidityUsd: dexScreener?.liquidityUsd ?? null,
+    priceUsd: dexScreener?.priceUsd ?? metaPrice.usdPrice ?? null,
     holders,
     sniperCount,
     bundledCount,
@@ -787,7 +789,8 @@ export default function Sift() {
           text-align: center;
         }
         .sift-h1 {
-          font-size: 46px; color: var(--ink-soft); line-height: 1.08; font-weight: 600; letter-spacing: -0.01em;
+          color: var(--ink);
+          font-size: 46px; line-height: 1.08; font-weight: 600; letter-spacing: -0.01em;
           margin: 0 0 16px;
         }
         .sift-sub {
@@ -1113,33 +1116,55 @@ export default function Sift() {
                     <p style={{ fontSize: 13, color: "var(--ink-soft)", lineHeight: 1.5, margin: "0 0 14px" }}>
                       {result.marketDataUnavailableReason}
                     </p>
-                    <div className="sift-row">
-                      <span className="sift-row-label">Total holders</span>
-                      <span className="sift-row-val">{result.totalHolders !== null ? result.totalHolders.toLocaleString() : "Unavailable"}</span>
-                    </div>
-                    <div className="sift-row">
-                      <span className="sift-row-label">Transfers</span>
-                      <span className="sift-row-val">{result.transfersCount !== null ? result.transfersCount.toLocaleString() : "Unavailable"}</span>
-                    </div>
+                    {result.totalHolders !== null && (
+                      <div className="sift-row">
+                        <span className="sift-row-label">Total holders</span>
+                        <span className="sift-row-val">{result.totalHolders.toLocaleString()}</span>
+                      </div>
+                    )}
+                    {result.transfersCount !== null && (
+                      <div className="sift-row">
+                        <span className="sift-row-label">Transfers</span>
+                        <span className="sift-row-val">{result.transfersCount.toLocaleString()}</span>
+                      </div>
+                    )}
                   </>
                 ) : (
                   <>
-                    <div className="sift-row">
-                      <span className="sift-row-label">Market cap{result.marketCapIsEstimate ? " (est.)" : ""}</span>
-                      <span className="sift-row-val">{formatUsd(result.marketCap)}</span>
-                    </div>
-                    <div className="sift-row">
-                      <span className="sift-row-label">ATH market cap {result.ath?.date ? `(${result.ath.date})` : ""}</span>
-                      <span className="sift-row-val">{result.ath ? formatUsd(result.ath.marketCap) : "Unavailable"}</span>
-                    </div>
-                    <div className="sift-row">
-                      <span className="sift-row-label">Pool age</span>
-                      <span className="sift-row-val">{result.poolAgeDays !== null ? `${result.poolAgeDays}d` : "Unavailable"}</span>
-                    </div>
-                    <div className="sift-row">
-                      <span className="sift-row-label">Total holders</span>
-                      <span className="sift-row-val">{result.totalHolders !== null ? result.totalHolders.toLocaleString() : "Unavailable"}</span>
-                    </div>
+                    {result.marketCap !== null && (
+                      <div className="sift-row">
+                        <span className="sift-row-label">Market cap{result.marketCapIsEstimate ? " (est.)" : ""}</span>
+                        <span className="sift-row-val">{formatUsd(result.marketCap)}</span>
+                      </div>
+                    )}
+                    {result.ath ? (
+                      <div className="sift-row">
+                        <span className="sift-row-label">ATH market cap {result.ath.date ? `(${result.ath.date})` : ""}</span>
+                        <span className="sift-row-val">{formatUsd(result.ath.marketCap)}</span>
+                      </div>
+                    ) : result.liquidityUsd !== null ? (
+                      <div className="sift-row">
+                        <span className="sift-row-label">Liquidity</span>
+                        <span className="sift-row-val">{formatUsd(result.liquidityUsd)}</span>
+                      </div>
+                    ) : null}
+                    {result.poolAgeDays !== null ? (
+                      <div className="sift-row">
+                        <span className="sift-row-label">Pool age</span>
+                        <span className="sift-row-val">{result.poolAgeDays}d</span>
+                      </div>
+                    ) : result.priceUsd !== null ? (
+                      <div className="sift-row">
+                        <span className="sift-row-label">Price</span>
+                        <span className="sift-row-val">{formatUsd(result.priceUsd, true)}</span>
+                      </div>
+                    ) : null}
+                    {result.totalHolders !== null && (
+                      <div className="sift-row">
+                        <span className="sift-row-label">Total holders</span>
+                        <span className="sift-row-val">{result.totalHolders.toLocaleString()}</span>
+                      </div>
+                    )}
                   </>
                 )}
 
