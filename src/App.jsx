@@ -787,8 +787,7 @@ export default function Sift() {
           text-align: center;
         }
         .sift-h1 {
-          color: var(--ink);
-          font-size: 46px; line-height: 1.08; font-weight: 600; letter-spacing: -0.01em;
+          font-size: 46px; var(--ink-soft); line-height: 1.08; font-weight: 600; letter-spacing: -0.01em;
           margin: 0 0 16px;
         }
         .sift-sub {
