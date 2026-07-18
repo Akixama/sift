@@ -143,8 +143,13 @@ async function getDexScreenerMarketData(chainKey, address) {
 
   const websites = best.info?.websites?.map((w) => w.url).filter(Boolean) || [];
   const socials = best.info?.socials?.map((s) => ({ platform: s.platform, handle: s.handle })).filter((s) => s.platform) || [];
-  const poolCreatedAt = best.pairCreatedAt || null;
-  const poolAgeDays = poolCreatedAt ? Math.floor((Date.now() - poolCreatedAt) / (1000 * 60 * 60 * 24)) : null;
+  // Age uses the EARLIEST pool we know about, not just the highest-liquidity one —
+  // a token can have an old pool that's since been eclipsed in depth by a newer one
+  // (migrations, new listings, arb pools), and "pool age" should reflect how long
+  // this token has actually had a market, not just how old the current deepest pool is.
+  const poolCreationTimestamps = pairs.map((p) => p.pairCreatedAt).filter((t) => typeof t === "number" && t > 0);
+  const earliestPoolCreatedAt = poolCreationTimestamps.length ? Math.min(...poolCreationTimestamps) : null;
+  const poolAgeDays = earliestPoolCreatedAt ? Math.floor((Date.now() - earliestPoolCreatedAt) / (1000 * 60 * 60 * 24)) : null;
   const liquidityUsd = best.liquidity?.usd != null ? Number(best.liquidity.usd) : null;
 
   return { marketCap, impliedSupply, websites, socials, poolAgeDays, liquidityUsd, priceUsd };
