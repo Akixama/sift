@@ -152,7 +152,7 @@ async function getDexScreenerMarketData(chainKey, address) {
   const poolAgeDays = earliestPoolCreatedAt ? Math.floor((Date.now() - earliestPoolCreatedAt) / (1000 * 60 * 60 * 24)) : null;
   const liquidityUsd = best.liquidity?.usd != null ? Number(best.liquidity.usd) : null;
 
-  return { marketCap, impliedSupply, websites, socials, poolAgeDays, liquidityUsd, priceUsd };
+  return { marketCap, impliedSupply, websites, socials, poolAgeDays, liquidityUsd, priceUsd, pairAddress: best.pairAddress || null };
 }
 
 async function getTokenMetaAndPrice(chainKey, address) {
@@ -168,12 +168,15 @@ async function getTokenMetaAndPrice(chainKey, address) {
   return { usdPrice, supply };
 }
 
-// Up to ~1000 daily candles on the token's highest-liquidity pair.
-async function getCandles(chainKey, bestPair) {
-  if (!bestPair) return [];
+// Up to ~1000 daily candles on a given pair. Callers should pass whichever pair
+// address is actually backing the current price/market cap figure — using a
+// different (Moralis-picked) pair here risks pulling a wild "high" from a thinly
+// traded pool that has nothing to do with the price anyone actually sees.
+async function getCandles(chainKey, pairAddress) {
+  if (!pairAddress) return [];
   const toDate = new Date().toISOString().slice(0, 10);
   const fromDate = new Date(Date.now() - 1000 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-  const ohlcv = await moralisFetch(chainKey, `/pairs/${bestPair.pair_address}/ohlcv`, {
+  const ohlcv = await moralisFetch(chainKey, `/pairs/${pairAddress}/ohlcv`, {
     timeframe: "1d",
     currency: "usd",
     fromDate,
@@ -539,14 +542,20 @@ async function analyze(address, chainKey = DEFAULT_CHAIN) {
   // the right pair for price candles.
   const pairsInfo = await getPairs(chainKey, addr).catch(() => ({ pairs: [], pairAddressSet: new Set(), bestPair: null }));
 
-  const [metaPriceResult, candlesResult, dexScreenerResult] = await Promise.allSettled([
+  const [metaPriceResult, dexScreenerResult] = await Promise.allSettled([
     getTokenMetaAndPrice(chainKey, addr),
-    getCandles(chainKey, pairsInfo.bestPair),
     getDexScreenerMarketData(chainKey, addr),
   ]);
   const metaPrice = metaPriceResult.status === "fulfilled" ? metaPriceResult.value : { usdPrice: null, supply: null };
-  const candles = candlesResult.status === "fulfilled" ? candlesResult.value : [];
   const dexScreener = dexScreenerResult.status === "fulfilled" ? dexScreenerResult.value : null;
+
+  // Candles MUST come from the same pair DexScreener used for the market cap figure
+  // above — pulling from a different (Moralis-picked) pair risks an ATH computed off
+  // a wild trade on a thin, unrelated pool that has nothing to do with the price
+  // anyone actually sees. Only fall back to Moralis's own pick if DexScreener has
+  // nothing for this token.
+  const candlePairAddress = dexScreener?.pairAddress || pairsInfo.bestPair?.pair_address || null;
+  const candles = await getCandles(chainKey, candlePairAddress).catch(() => []);
 
   // Prefer DexScreener's real, published market cap. Fall back to price × on-chain
   // total supply (technically FDV, not true market cap) only if DexScreener has
