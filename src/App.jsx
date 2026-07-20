@@ -203,6 +203,14 @@ async function getDexScreenerMarketData(chainKey, address) {
   // one — used to widen LP exclusion beyond whatever Moralis's own /pairs endpoint
   // happens to have indexed (which can lag on newer chains, e.g. Monad).
   const allPairAddresses = pairs.map((p) => p.pairAddress?.toLowerCase()).filter(Boolean);
+  // Address + liquidity for every pool, so the ATH search can check several of a
+  // token's pools (not just the current deepest one) — a token's true all-time-high
+  // spike can have happened on an earlier pool that's since been eclipsed in depth,
+  // and that pool's own candle history is otherwise invisible if we only ever look at
+  // whichever pool is deepest right now.
+  const poolsByLiquidity = pairs
+    .map((p) => ({ address: p.pairAddress?.toLowerCase(), liquidityUsd: Number(p.liquidity?.usd || 0) }))
+    .filter((p) => p.address);
 
   return {
     marketCap,
@@ -214,6 +222,7 @@ async function getDexScreenerMarketData(chainKey, address) {
     priceUsd,
     pairAddress: best.pairAddress || null,
     allPairAddresses,
+    poolsByLiquidity,
   };
 }
 
@@ -625,20 +634,32 @@ async function analyze(address, chainKey = DEFAULT_CHAIN) {
   const metaPrice = metaPriceResult.status === "fulfilled" ? metaPriceResult.value : { usdPrice: null, supply: null };
   const dexScreener = dexScreenerResult.status === "fulfilled" ? dexScreenerResult.value : null;
 
-  // Candles MUST come from the same pair DexScreener used for the market cap figure
-  // above — pulling from a different (Moralis-picked) pair risks an ATH computed off
-  // a wild trade on a thin, unrelated pool that has nothing to do with the price
-  // anyone actually sees. Only fall back to Moralis's own pick if DexScreener has
-  // nothing for this token.
-  const candlePairAddress = dexScreener?.pairAddress || pairsInfo.bestPair?.pair_address || null;
-  const candles = await getCandles(chainKey, candlePairAddress).catch(() => []);
-
   // Prefer DexScreener's real, published market cap. Fall back to price × on-chain
   // total supply (technically FDV, not true market cap) only if DexScreener has
   // nothing for this chain/token — flagged honestly in the UI either way.
   const marketCap = dexScreener?.marketCap ?? (metaPrice.usdPrice && metaPrice.supply ? metaPrice.usdPrice * metaPrice.supply : null);
   const marketCapIsEstimate = dexScreener?.marketCap == null;
   const supplyForAth = dexScreener?.impliedSupply ?? metaPrice.supply;
+
+  // ATH search checks the top few pools by liquidity, not just the single deepest one
+  // right now — a token's true all-time-high spike can have happened on an earlier
+  // pool that's since been eclipsed in depth (liquidity migrations, new listings), and
+  // that pool's own candle history is otherwise invisible if we only ever look at
+  // whichever pool happens to be deepest today. Capped at 3 pools to bound the extra
+  // round-trips this costs.
+  const MAX_ATH_POOLS = 3;
+  const candidatePools = [
+    ...pairsInfo.pairs.map((p) => ({ address: p.pair_address?.toLowerCase(), liquidityUsd: Number(p.liquidity_usd || 0) })),
+    ...(dexScreener?.poolsByLiquidity || []),
+  ].filter((p) => p.address);
+  const poolMap = new Map();
+  candidatePools.forEach((p) => {
+    const existing = poolMap.get(p.address);
+    if (!existing || p.liquidityUsd > existing.liquidityUsd) poolMap.set(p.address, p);
+  });
+  const topPools = [...poolMap.values()].sort((a, b) => b.liquidityUsd - a.liquidityUsd).slice(0, MAX_ATH_POOLS);
+  const athCandleSets = await Promise.all(topPools.map((p) => getCandles(chainKey, p.address).catch(() => [])));
+  const candles = athCandleSets.flat();
   const ath = computeAth(candles, supplyForAth, marketCap);
 
   // Merge Moralis's own pair addresses with every pool DexScreener knows about — on
