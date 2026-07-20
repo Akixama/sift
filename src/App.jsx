@@ -199,8 +199,22 @@ async function getDexScreenerMarketData(chainKey, address) {
   const earliestPoolCreatedAt = poolCreationTimestamps.length ? Math.min(...poolCreationTimestamps) : null;
   const poolAgeDays = earliestPoolCreatedAt ? Math.floor((Date.now() - earliestPoolCreatedAt) / (1000 * 60 * 60 * 24)) : null;
   const liquidityUsd = best.liquidity?.usd != null ? Number(best.liquidity.usd) : null;
+  // Every pool address DexScreener knows about for this token, not just the deepest
+  // one — used to widen LP exclusion beyond whatever Moralis's own /pairs endpoint
+  // happens to have indexed (which can lag on newer chains, e.g. Monad).
+  const allPairAddresses = pairs.map((p) => p.pairAddress?.toLowerCase()).filter(Boolean);
 
-  return { marketCap, impliedSupply, websites, socials, poolAgeDays, liquidityUsd, priceUsd, pairAddress: best.pairAddress || null };
+  return {
+    marketCap,
+    impliedSupply,
+    websites,
+    socials,
+    poolAgeDays,
+    liquidityUsd,
+    priceUsd,
+    pairAddress: best.pairAddress || null,
+    allPairAddresses,
+  };
 }
 
 async function getTokenMetaAndPrice(chainKey, address) {
@@ -627,7 +641,16 @@ async function analyze(address, chainKey = DEFAULT_CHAIN) {
   const supplyForAth = dexScreener?.impliedSupply ?? metaPrice.supply;
   const ath = computeAth(candles, supplyForAth, marketCap);
 
-  const holdersResult = await analyzeHolders(chainKey, addr, pairsInfo.pairAddressSet, candles, supplyForAth).catch(() => null);
+  // Merge Moralis's own pair addresses with every pool DexScreener knows about — on
+  // newer chains (Monad especially) Moralis's /pairs coverage can lag behind, letting
+  // a real liquidity pool slip through as a fake "whale" in the top-10 list. Combining
+  // both sources catches a pool that either one alone would miss.
+  const mergedPairAddressSet = new Set([
+    ...pairsInfo.pairAddressSet,
+    ...(dexScreener?.allPairAddresses || []),
+  ]);
+
+  const holdersResult = await analyzeHolders(chainKey, addr, mergedPairAddressSet, candles, supplyForAth).catch(() => null);
   const holderData = holdersResult;
 
   const topHolderPct = holderData ? holderData.totalPct : null;
