@@ -13,6 +13,16 @@ const CHAINS = {
 };
 const DEFAULT_CHAIN = "monad";
 
+// Each chain's own explorer, used for per-holder "view wallet" links. All four chains
+// here are EVM, so this is Etherscan/Basescan/etc. — never Solscan, which is Solana's
+// explorer and has no address overlap with any chain Sift supports.
+const EXPLORER_ADDRESS_BASE = {
+  monad: "https://monadvision.com/address/",
+  ethereum: "https://etherscan.io/address/",
+  base: "https://basescan.org/address/",
+  robinhood: "https://robinhoodchain.blockscout.com/address/",
+};
+
 // ---------- Onchain scan log (Monad Testnet) ----------
 // Every verdict gets an optional permanent record on Monad via the ScanRegistry
 // contract, so a "Looks clean." isn't just a UI toast that vanishes on refresh — it's
@@ -74,13 +84,51 @@ async function moralisFetch(chainKey, path, params = {}) {
   return res.json();
 }
 
-// Fetch a buffer of 15 so that after filtering out the LP pair address(es), we still
-// have a real top 10 of actual wallets left.
-async function getTopHolders(chainKey, address, pairAddressSet, limit = 15) {
+// Hardcoded burn/dead addresses — these hold "supply" that was deliberately destroyed,
+// not tokens any real person controls, so they get excluded the same way pool
+// addresses do rather than inflating or distorting the top-10 list.
+const BURN_ADDRESSES = new Set([
+  "0x0000000000000000000000000000000000000000",
+  "0x000000000000000000000000000000000000dead",
+]);
+
+// Moralis's /erc20/{address}/pairs endpoint is the primary way we identify LP pool
+// addresses to exclude from "top holders" — but it doesn't index every pool (gaps are
+// most common on newer Uniswap V3 pools or less-common DEXs), so a pool can slip
+// through as a false "whale." As a second layer, Moralis's owners endpoint also
+// returns a label for well-known contract addresses when it has one (e.g. "Uniswap V2:
+// USDC-WETH"); anything labeled as a pool/router/vault gets excluded here too, even if
+// /pairs missed it.
+const LP_LABEL_PATTERN = /uniswap|sushiswap|pancakeswap|curve|balancer|\bv2\b|\bv3\b|\blp\b|pool|pair|router|vault|liquidity/i;
+
+function isLikelyPoolOrBurn(owner, pairAddressSet) {
+  const addr = owner.owner_address?.toLowerCase();
+  if (!addr) return true; // no address at all — can't be a real wallet, drop it
+  if (pairAddressSet.has(addr)) return true;
+  if (BURN_ADDRESSES.has(addr)) return true;
+  const label = owner.owner_address_label || owner.entity || "";
+  if (label && LP_LABEL_PATTERN.test(label)) return true;
+  return false;
+}
+// Total lifetime transaction count for a wallet on this chain, used only to flag
+// likely fresh/sniper wallets (a wallet with almost no history before buying this
+// token is a much stronger signal than block-timing alone). Fetched lazily — only
+// when the person actually expands the holder list — since pulling this for 10
+// wallets on every single check would add real latency for something most people
+// won't look at.
+const NEW_WALLET_TX_THRESHOLD = 3;
+
+async function getWalletTxCount(chainKey, address) {
+  const data = await moralisFetch(chainKey, `/wallets/${address}/stats`, {});
+  const total = data?.transactions?.total;
+  return total != null ? Number(total) : null;
+}
+
+async function getTopHolders(chainKey, address, pairAddressSet, limit = 30) {
   const data = await moralisFetch(chainKey, `/erc20/${address}/owners`, { order: "DESC", limit: String(limit) });
   const owners = Array.isArray(data?.result) ? data.result : [];
   return owners
-    .filter((o) => !pairAddressSet.has(o.owner_address?.toLowerCase()))
+    .filter((o) => !isLikelyPoolOrBurn(o, pairAddressSet))
     .slice(0, 10)
     .map((o) => ({
       address: o.owner_address,
@@ -548,7 +596,8 @@ async function analyze(address, chainKey = DEFAULT_CHAIN) {
   const addr = address.trim();
 
   if (PROVIDER_BY_CHAIN[chainKey] === "blockscout") {
-    return analyzeBlockscout(addr, chainKey);
+    const result = await analyzeBlockscout(addr, chainKey);
+    return { ...result, fetchedAt: Date.now() };
   }
 
   // Fetch pairs first — needed to filter the LP address out of top holders and to pick
@@ -632,6 +681,7 @@ async function analyze(address, chainKey = DEFAULT_CHAIN) {
     address: addr,
     chainKey,
     provider: "moralis",
+    fetchedAt: Date.now(),
     tier,
     flags,
     headline,
@@ -678,6 +728,11 @@ function socialUrl(s) {
   return handle || "#";
 }
 
+function formatFetchedAt(ts) {
+  if (!ts) return null;
+  return new Date(ts).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
+}
+
 function formatUsd(value, precise = false) {
   if (value === null || value === undefined || Number.isNaN(value)) return "Unavailable";
   if (value === 0) return "$0";
@@ -709,6 +764,8 @@ export default function Sift() {
   const [result, setResult] = useState(null);
   const [expanded, setExpanded] = useState(false);
   const [holdersOpen, setHoldersOpen] = useState(false);
+  const [walletTxCounts, setWalletTxCounts] = useState({}); // address -> count | null, filled in lazily
+  const [walletStatsLoading, setWalletStatsLoading] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState(null);
   const [onchainStatus, setOnchainStatus] = useState("idle"); // idle | pending | done | error
@@ -734,12 +791,42 @@ export default function Sift() {
     }
   };
 
+  // Lazily fetches each top-holder wallet's lifetime tx count, only the first time
+  // the holder list is actually expanded — not on every check, since this is 10 extra
+  // calls most people won't look at. Only supported on Moralis-backed chains for now;
+  // Blockscout's equivalent per-address stats schema isn't confirmed, so Robinhood
+  // just won't show fresh-wallet tags rather than guessing at a field that may not exist.
+  const toggleHolders = () => {
+    setHoldersOpen((v) => {
+      const next = !v;
+      if (next && result?.provider === "moralis" && result.holders?.length && !walletStatsLoading) {
+        setWalletStatsLoading(true);
+        Promise.all(
+          result.holders.map(async (h) => {
+            if (!h.address) return [h.address, null];
+            try {
+              const count = await getWalletTxCount(result.chainKey, h.address);
+              return [h.address, count];
+            } catch {
+              return [h.address, null];
+            }
+          })
+        ).then((entries) => {
+          setWalletTxCounts((prev) => ({ ...prev, ...Object.fromEntries(entries) }));
+          setWalletStatsLoading(false);
+        });
+      }
+      return next;
+    });
+  };
+
   const runCheck = async () => {
     if (!input.trim()) return;
     timers.current.forEach(clearTimeout);
     timers.current = [];
     setExpanded(false);
     setHoldersOpen(false);
+    setWalletTxCounts({});
     setError(null);
     setOnchainStatus("idle");
     setOnchainTxHash(null);
@@ -774,6 +861,7 @@ export default function Sift() {
     setInput("");
     setExpanded(false);
     setHoldersOpen(false);
+    setWalletTxCounts({});
     setOnchainStatus("idle");
     setOnchainTxHash(null);
     setOnchainError(null);
@@ -1104,7 +1192,10 @@ export default function Sift() {
 
         {phase === "result" && result && (
           <div className="sift-card">
-            <div className="sift-verdict-eyebrow">Verdict · {CHAINS[result.chainKey]?.label || "Monad"}</div>
+            <div className="sift-verdict-eyebrow">
+              Verdict · {CHAINS[result.chainKey]?.label || "Monad"}
+              {result.fetchedAt && ` · live as of ${formatFetchedAt(result.fetchedAt)}`}
+            </div>
             <h2 className="sift-verdict-h" style={{ color: tierColor(result.tier) }}>
               {result.headline}
             </h2>
@@ -1195,7 +1286,7 @@ export default function Sift() {
                   </>
                 )}
 
-                <button className="sift-row sift-row-toggle" onClick={() => setHoldersOpen((v) => !v)}>
+                <button className="sift-row sift-row-toggle" onClick={toggleHolders}>
                   <span className="sift-row-label">
                     <ChevronDown
                       size={13}
@@ -1208,23 +1299,43 @@ export default function Sift() {
 
                 {holdersOpen && result.holders && result.holders.length > 0 && (
                   <div className="sift-holders">
-                    {result.holders.map((h) => (
-                      <div className="sift-holder-row" key={h.address}>
-                        <span>
-                          <span className="sift-holder-addr" style={{ display: "block" }}>
-                            {h.address ? `${h.address.slice(0, 8)}…${h.address.slice(-6)}` : "unknown"}
+                    {result.provider === "moralis" && walletStatsLoading && (
+                      <div className="sift-holder-sent" style={{ padding: "4px 0 8px" }}>Checking wallet history…</div>
+                    )}
+                    {result.holders.map((h) => {
+                      const txCount = walletTxCounts[h.address];
+                      const isNewWallet = txCount !== undefined && txCount !== null && txCount <= NEW_WALLET_TX_THRESHOLD;
+                      const explorerBase = EXPLORER_ADDRESS_BASE[result.chainKey];
+                      return (
+                        <div className="sift-holder-row" key={h.address}>
+                          <span>
+                            <span className="sift-holder-addr" style={{ display: "block" }}>
+                              {h.address ? `${h.address.slice(0, 8)}…${h.address.slice(-6)}` : "unknown"}
+                              {h.address && explorerBase && (
+                                <a
+                                  href={`${explorerBase}${h.address}`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  style={{ marginLeft: 6, color: "inherit", verticalAlign: -1 }}
+                                  aria-label="View wallet on explorer"
+                                >
+                                  <ExternalLink size={11} style={{ display: "inline" }} />
+                                </a>
+                              )}
+                            </span>
+                            <span className="sift-holder-sent">
+                              sent to {h.sentToCount} wallet{h.sentToCount === 1 ? "" : "s"}
+                            </span>
                           </span>
-                          <span className="sift-holder-sent">
-                            sent to {h.sentToCount} wallet{h.sentToCount === 1 ? "" : "s"}
+                          <span className="sift-holder-tags">
+                            {isNewWallet && <span className="sift-tag sift-tag-amber">new wallet</span>}
+                            {h.isSniper === true && <span className="sift-tag sift-tag-amber">sniper</span>}
+                            {h.isBundled && <span className="sift-tag sift-tag-amber">bundled</span>}
+                            <span className="sift-holder-pct">{h.pct}%</span>
                           </span>
-                        </span>
-                        <span className="sift-holder-tags">
-                          {h.isSniper === true && <span className="sift-tag sift-tag-amber">sniper</span>}
-                          {h.isBundled && <span className="sift-tag sift-tag-amber">bundled</span>}
-                          <span className="sift-holder-pct">{h.pct}%</span>
-                        </span>
-                      </div>
-                    ))}
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
               </div>
